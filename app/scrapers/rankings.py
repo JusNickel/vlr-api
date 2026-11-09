@@ -1,0 +1,91 @@
+"""Team rankings scraper — /rankings (world) and /rankings/{region}.
+
+ONE parser, TWO markup shapes. vlr serves a stripped table for the world view
+and rich div rows for regional views (full detail in the RANK_* block of
+selectors.py). The practical consequence for anyone reading this output:
+
+  - world rows have NO W/L record and NO earnings — record/wins/losses/earnings
+    are legitimately null there. Do not "fix" that by widening the selectors;
+    the columns genuinely don't exist in that layout.
+  - `rank` and `rating` come back as STRINGS, matching the rest of the scrapers.
+    Coercion happens downstream so an unparseable value degrades to null instead
+    of failing the whole page.
+
+The region slug is the FULL name ("north-america"), not vlr's nav abbreviation
+("na"). Callers validate the slug against an allow-list before it reaches here —
+an unknown slug makes vlr serve a 404 page that parses to zero rows.
+"""
+import re
+from typing import Any
+
+from selectolax.parser import HTMLParser, Node
+
+from app.core.http import get_client
+from app.scrapers import selectors as S
+from app.scrapers._util import clean_spaces, first_text, id_from_href, text_of
+
+_DIGIT_RUN = re.compile(r"\d+")
+
+
+def _split_record(raw: str | None) -> tuple[str | None, str | None]:
+    """Split a rankings W/L record into (wins, losses) as clean numeric strings.
+
+    vlr renders it as 'wins–losses' (en-dash, e.g. '74–35') on regional pages, and
+    historically as 'NNW - NNL'. We pull the first two digit runs, so any dash
+    variant (–/—/-), 'W'/'L' labels, or a nested label span coerce cleanly to two
+    numbers (parseNumeric-friendly: a value or null, never NaN). Fewer than two
+    numbers (incl. the world view, which carries no record) -> (None, None).
+
+    Deliberately operates on the div.rank-item-record SUMMARY text only — never the
+    per-match mod-win/mod-loss dots, which would concatenate into wrong numbers."""
+    if not raw:
+        return None, None
+    nums = _DIGIT_RUN.findall(raw)
+    if len(nums) < 2:
+        return None, None
+    return nums[0], nums[1]
+
+
+def _team_name(row: Node) -> str:
+    """The team-name node's DIRECT text only. The node nests a #tag span
+    (regional) and the country div (both views) as CHILDREN — deep text would
+    concatenate them in ("100 Thieves#XSN United States"), and suffix-stripping
+    the country back off still left the tag (the bug shipped by the old
+    approach). text(deep=False) excludes every child in one move."""
+    node = row.css_first(S.RANK_TEAM_NAME)
+    if node is None:
+        return ""
+    return clean_spaces(node.text(deep=False))
+
+
+def _parse_row(row: Node) -> dict[str, Any]:
+    link = row.css_first("a")
+    href = link.attributes.get("href", "") if link else ""
+    country = clean_spaces(first_text(row, S.RANK_COUNTRY))
+    team = _team_name(row)
+    # current/rating-window record (the first of the two record nodes); split into
+    # clean wins/losses so each coerces numerically. Null on the world view.
+    record = clean_spaces(first_text(row, S.RANK_RECORD)) or None
+    wins, losses = _split_record(record)
+    return {
+        "rank": first_text(row, S.RANK_NUM) or None,
+        "team": team or None,
+        "team_id": id_from_href(href) if href else None,
+        "country": country or None,
+        "rating": first_text(row, S.RANK_RATING) or None,
+        "record": record,
+        "wins": wins,
+        "losses": losses,
+        "earnings": clean_spaces(first_text(row, S.RANK_EARNINGS)) or None,
+    }
+
+
+def parse_rankings(html: str) -> list[dict[str, Any]]:
+    tree = HTMLParser(html)
+    return [_parse_row(r) for r in tree.css(S.RANK_ROW)]
+
+
+async def fetch_rankings(region: str = "all") -> list[dict[str, Any]]:
+    path = "/rankings" if region == "all" else f"/rankings/{region}"
+    html = await get_client().get_html(path)
+    return parse_rankings(html)

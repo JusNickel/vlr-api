@@ -1,0 +1,754 @@
+# vlr-api — progress
+
+Counts here mirror `app/status_meta.py` (the committed source of truth). Keep them
+in sync: bump both in the same commit.
+
+- **Phases shipped:** 14 / 14
+- **Tests passing:** 207 backend + 173 frontend
+- **Commit:** phase14
+
+## Bugfix — map-name/duration label-bleed (2026-09-06)
+
+Reported via `/api/v1/match/734314`: every map's `name` carried a trailing
+duration ("Abyss55:04" instead of "Abyss"), while scores/rounds/teams were fine.
+
+Root cause, found via the app's httpx client against the live page (never curl):
+vlr's `div.map` wraps the name in its own `font-weight:700` node (name text +
+an inline PICK/DEC marker span) with a **sibling** `div.map-duration` ("mm:ss")
+right next to it. `match_detail.py` read `div.map`'s raw `text()` — concatenating
+name + PICK/DEC + duration — then stripped only the PICK/DEC token, leaving the
+duration bled into `name`. Same label-bleed class already handled elsewhere
+(`selectors.py`), just not here.
+
+Also found live: vlr moved the games-nav item (`MATCH_NAV_ITEM`, the preferred
+name source before falling back to `div.map`) from a `<div>` to an `<a>` tag,
+so the div-scoped selector matched nothing and every map silently fell through
+to the polluted fallback path. Both fixed together since the second is what
+made the first load-bearing on every request instead of a rare fallback.
+
+Fix: added `MATCH_GAME_MAP_NAME` (the name node alone, scoped under `div.map`)
+and `MATCH_GAME_MAP_DURATION` (the sibling node); `_parse_game` now reads the
+name from the dedicated node and exposes duration as its own `duration` field
+(kept, not discarded) instead of folding it into `name`. `MATCH_NAV_ITEM`
+loosened to match by class regardless of tag. verify.py's `_check_match_detail`
+gained a cheap `\d+:\d+` guard on map names to close the silent-break gap.
+Tests: `+1` (label-bleed regression, real captured markup shape) plus an
+`isalpha()` invariant added to the existing maps test. Verified live against
+matches 734314 and 747672. 206 → 207.
+
+## Phase 14 — team search + assistant (2026-09-02)
+
+Closes the name-resolution gap for the Command Central / Jarvis assistant, which
+refers to teams by NAME while every other endpoint keys by numeric id.
+
+1. **`GET /api/v1/teams?q=<name>`** — team-search primitive. DB-first over
+   `team_snapshots.name` (DISTINCT-ON team_id, latest snapshot), VLR `/search/auto`
+   fallback on a miss (cached, own `vlr:search:team:` namespace). Mirrors player
+   search exactly (`services/search.py`). Envelope `{data, stale, error}`; hits are
+   `{id, name, tag, country, source}` (`tag` is always null — not banked in
+   team_snapshots; `/team/{id}` carries it downstream). Never 500s.
+2. **`GET /api/v1/assistant/team-match?name=<name>`** — one deterministic answer.
+   Resolves the name via the primitive, then returns the team's single most
+   relevant match in fixed priority **LIVE > NEXT > LAST**, with `data.state` ∈
+   `live|upcoming|completed|none` so the LLM branches unconditionally. LIVE carries
+   map-level score AND the current-map ROUND score, oriented to the team. Pure
+   orchestration over existing caches + the bounded on-demand detail refreshes
+   (`services/assistant.py`); no new scraping, no new selectors. Team-not-found is a
+   clean envelope error, never a 500.
+3. **Round-score null-stub rule.** A live map's `rounds[]` ends in a not-yet-played
+   null-stub round (winner/side/outcome/score all None). `count_map_rounds` counts
+   only rounds with a real winner, so a map with 6 played + 1 null stub reports 6,
+   not 7 (asserted directly in `tests/test_assistant.py`).
+4. **verify.py** now resolves a known name ("Sentinels") through both `search_teams`
+   and `team_match` end-to-end — the same silent-break blind-spot class we've been
+   closing (a new endpoint absent from verify).
+5. **Tests (+28, 178 → 206):** `tests/test_search.py` +10 (team statement shape,
+   autocomplete team-filter/dedup/bad-json, DB-hit/miss/fallback/cache-namespace/
+   graceful); `tests/test_assistant.py` +18 (null-stub round counting, current-map
+   pick, side alignment, live-card matching, shaping, and the orchestrator's
+   LIVE/upcoming/completed/none/not-found/degrade paths).
+
+## Diagnostics conventions
+
+Lessons from debugging sessions — apply before assuming a scraper or selector is broken.
+
+1. **Null/missing field? Check the HTTP status first.** When `GET /player/{id}` returns
+   `alias: null`, reach for `curl -s http://127.0.0.1:8000/api/v1/player/{id} | jq .` and
+   look at the status + top-level error before opening the scraper. A 404 means the
+   id doesn't exist or the cache is cold; a 200 with null means the scraper parsed but
+   the field is absent/unexpected. These are different root causes with different fixes.
+
+2. **Endpoint naming: singular vs plural matters.** Player DETAIL is `/player/{id}`
+   (singular — the `/player/` prefix, same as vlr.gg's own URL shape). Player
+   DIMENSIONS is `/players/{id}/dimensions` (plural — the stats-leaderboard family).
+   Mixing them gives a 404 that looks like a bug but is just the wrong path.
+
+## Selector audit pass (2026-07-15) — Phase 3: cleanup + verify hardening
+
+Follow-up to the 2026 vlr rewrite adaptations. Tests stay at **173** (expectations
+updated, none added/removed).
+
+1. **Regional rankings #tag pollution — FIXED.** The regional team-name node
+   (`div.ge-text`) nests the roster #tag span AND the country div as children; the
+   old deep-text + country-suffix-strip left `"100 Thieves#XSN"`. The parser now
+   reads the node's **direct text only** (`text(deep=False)`), excluding every
+   child in one move. Verified against the live NA capture: 194/194 clean names.
+2. **Stats leaderboard keyed by `data-col` — MIGRATED.** `/stats` value cells carry
+   vlr's machine-readable `data-col` attrs (same scheme as the match scoreboard);
+   `STATS_COL_KEYS` replaces the header-title map, killing the parallel-scheme
+   hazard (column reorders / header renames can't shift values). NB vlr's names
+   differ from headers: `fbpr`=FKPR, `hsp`=HS%, `clp`=CL%.
+3. **Double-matching list alternates dropped.** `MATCH_TEAMS`/`MATCH_SCORES` lost
+   their nested comma-fallbacks (`div.text-of` / `div.js-spoiler`) — both ALSO
+   matched live nodes, returning 4/card with `[:2]` truncation correct only by
+   document order. Primaries alone match 2/2 on all 50 live cards of each list page.
+4. **Dead weight removed.** Retired never-matching alternates (`span.ml-status`,
+   `a.news-item`, `div.news-item-meta`, `tr.rank-item`, `div.rank-item-team-name`)
+   and unreferenced constants (`PLAYER_MATCH_TEAM_NAME`, `MATCH_H_EVENT_LINK`).
+5. **`opponent_id` KEPT (always null).** `frontend/src/lib/vlr.ts` maps it to
+   `opponentId`, so the key stays; the comment now states vlr exposes NO opponent
+   team link on match cards (it was never "often" — it's always null).
+6. **Stale synthetic fixtures rebuilt from real captures.** `rankings.html` (world
+   view) and `news.html` still used pre-rewrite markup the selectors no longer
+   target; both are now faithful trims of live pages captured 2026-07-14.
+7. **`verify` extended** (all checks offline-validated against the captures, with
+   negative controls): regional rankings fetch (record/earnings present, no `#` in
+   names — would have caught fix 1), johnqt(1265)=Sentinels / TenZ=null current-team
+   pair, per-card ml-status ∈ {live,upcoming,completed} without requiring a live
+   match, match header teams/format + completed-map rounds, `/search/auto` JSON
+   shape (player hits carry id+alias), and semantically-scoped child-field asserts
+   (numeric scores on COMPLETED cards only — upcoming's `–` placeholder is valid).
+
+> Selector changes still need a container run of `python -m app.scrapers.verify`
+> (sandbox has no vlr.gg access; checks were validated against banked captures).
+
+## vlr-api repair pass (2026-06-10) — three bundled selector/endpoint fixes
+
+Container-verified through the app's httpx client (never curl). Resolves the three
+deferred vlr-api gaps logged in the frontend slices below.
+
+1. **W/L selector drift (rankings) — RESOLVED.** Root cause found via live markup:
+   vlr split rankings into a **world** view (`/rankings`, `?region=all`) that dropped
+   the W/L column entirely, and **regional** pages (`/rankings/<full-region-slug>`,
+   e.g. `north-america`) that still carry it in `div.rank-item-record`. The selector
+   hadn't been renamed — the data simply isn't on the world view the frontend defaults
+   to. Fix: parser now splits the record ("74–35", en-dash) into clean `wins`/`losses`
+   numeric fields (robust to dash/label variants), targeting the record summary node —
+   never the per-match `mod-win`/`mod-loss` dots (the concatenation trap). World view →
+   record/wins/losses null (valid). Verified: `/rankings/north-america` → G2 Esports
+   `74–35` → wins 74, losses 35. Tests: `+2` (regional record split + world-view null).
+2. **Phase 7 match-detail scoreboard selectors — BUILT.** New `app/scrapers/match_detail.py`
+   + selectors for `table.wf-table-inset.mod-overview` (8 per match: per-map × per-team
+   + all-maps aggregate). Every value cell reads `span.mod-both`, NEVER raw `td.text()`
+   (which concatenates the three side-split spans: K=13 renders raw as "1385" — coerces
+   fine, silently wrong). `mod-t`/`mod-ct` (attack/defense) preserved. `parse_numeric` +
+   new `parse_percent` (KAST/HS%) in `_util.py`, null-not-NaN. Tested against BOTH banked
+   fixtures: partial (R/ACS/ADR empty → null) and filled (all populated). Tests: `+9`.
+3. **Team-endpoint 404 handler (Bug A) — RESOLVED.** `app/core/http.py` raises a domain
+   `VlrNotFound` on an upstream 404 (final, not retried); the `/team/{id}` route maps it
+   to a clean HTTP 404 instead of the old unhandled-`raise_for_status` 500. Verified live:
+   `/team/1` → `VlrNotFound` → 404; `/team/2` → 200 (Sentinels, full roster + results).
+   Tests: `+3`. (Bug B / id 1001 was already resolved — SQL_ASCII re-encode.)
+
+> Note: the running uvicorn predates this pass; a `systemctl restart vlr-api` is needed
+> to surface these on the live HTTP endpoints. The code + container-level verification
+> (through the app's httpx client, per the repair rules) are complete.
+
+## Phases
+
+- [x] **Phase 1 — league listings** — results, upcoming/live, rankings, events, news + history
+- [x] **Phase 2 — player detail** — on-demand fetch + PlayerSnapshot history
+- [x] **Phase 3 — team detail** — on-demand fetch + TeamSnapshot history
+- [x] **Phase 4 — team trends** — rating trend joined with results
+- [x] **Phase 5 — results backfill** — team-page results into match_results, id-join
+- [x] **Phase 6 — status dashboard** — self-describing status page (this phase)
+- [x] **Phase 7 — match detail** — rich `/match/{id}` endpoint (header/maps/scoreboards/round timeline + `streams` Twitch channel logins), `refresh_match`, `VlrNotFound` → 404
+- [x] **Phase 8 — player trends** — rating/ACS trend over banked `PlayerSnapshot` history (rounds-weighted overall), `/trends/player/{id}`, no new scraper/table
+- [x] **Phase 9 — player pre-scrape** — twice-daily scheduler job banks a `PlayerSnapshot` for every player in the next ~48h of matches (cache-gated), so trend history accumulates instead of waiting for on-demand views
+- [x] **Phase 10 — player search** — `GET /players?q=` hybrid: DB-first over `PlayerSnapshot` (clean read), VLR autocomplete fallback only on a DB miss (cached like the detail endpoints); self-healing as Phase 9 banks more
+- [x] **Phase 11 — live match auto-refresh** — 30s scheduler job re-scrapes each LIVE match's detail + status-aware short cache TTL (live=30s, completed=10m); the match page polls `/api/match/[id]` while live so scores/stats/timeline update without a reload
+- [x] **Phase 12 — stats leaderboard** — HLTV-style region-wide player rankings led by VLR's OWN R2.0 rating (no composite computed); 6h scheduler job warms na/eu × 30d/60d/90d/all into cache; `GET /stats` reads cache-only and returns the `{data, stale, error}` envelope; frontend `/stats` island with region/timespan toggles + numeric-safe sortable columns
+- [x] **Phase 13 — dimension-split rating** — four-dimension breakdown (Firepower/Entry/Consistency/Clutch) as 0-100 cohort percentiles; `GET /players/{id}/dimensions?region=&timespan=`; radar chart + labeled bars on player detail page; low-confidence flags; `app/ratings/dimensions.py` pure compute module
+
+## Phase 13 — dimension-split rating (Firepower/Entry/Consistency/Clutch)
+
+A four-dimension player rating breakdown computed as 0-100 cohort percentiles.
+Supplements R2.0 — R2.0 stays the headline; this adds CONTEXT to it. No new
+scraping, no new selectors. Computes over stats we already have from /stats.
+
+- [x] **`app/ratings/dimensions.py`** — pure `compute_dimensions(player_stats, cohort) -> dict`
+  with a `pctile(value, all_values) -> 0-100` helper (strict-below formula;
+  min→0, max→100, median→50, None→0, <2 cohort→50). Derived stats: `fk_fd_ratio`,
+  `fk_share`, `clutch_vol_adj` computed per-player AND across the full cohort.
+  FDPR inverted in CONSISTENCY (fewer first-deaths = better). Weights LOCKED:
+  `FIREPOWER = 0.40*acs + 0.25*kpr + 0.20*kd + 0.15*kmax`;
+  `ENTRY = 0.45*fk_fd + 0.30*fkpr + 0.25*fk_share`;
+  `CONSISTENCY = 0.55*kast + 0.25*apr + 0.20*(100-fdpr)`;
+  `CLUTCH = 0.40*clutch_pct + 0.35*vol_adj + 0.25*kd`.
+  Low-confidence flags: `"clutch"` if `cl_played < 5`; `"all"` if `rnd < 100`.
+- [x] **`GET /players/{id}/dimensions?region=&timespan=`** — reads the cached
+  cohort (cold-miss → single-combo refresh, same as /stats); finds the player by
+  `player_id`; returns `{player_id, region, timespan, firepower, entry, consistency,
+  clutch, low_confidence}`. 404 when player not in that leaderboard. 400 on bad
+  region/timespan. No scraping inline.
+  - [x] **Cache-race fallback** (fix): empty or partial cohort during a scheduler
+    re-warm window triggers ONE fresh recompute before concluding 404. Player absent
+    after recompute → genuine 404; cohort still empty → 503.
+- [x] **Frontend: `RatingBreakdown.tsx`** — four-axis radar (diamond SVG; Firepower
+  top, Entry right, Consistency bottom, Clutch left; grid at 25/50/75/100%;
+  teal accent fill); four labeled bars "FIREPOWER — 94th in NA" (ordinal
+  formatting: 1st/2nd/3rd/4th…); low-confidence dimensions faded (opacity-50) +
+  asterisk + `title="Limited sample — low confidence"`. Out-of-cohort players (APAC/
+  VN, not in NA or EU) see an explanatory empty state ("Rating breakdown unavailable
+  — this player isn't in the NA or EU leaderboard.") instead of a silent blank.
+- [x] **Player detail page** — `getPlayerDimensions(id)` tries `na` then `eu`
+  (player appears in exactly one regional leaderboard); fetched in parallel with
+  `getPlayer`+`getPlayerTrend`; `<RatingBreakdown dims={dims} />` inserted between
+  `PlayerCard` and `PlayerStatsPanel`.
+- [x] **Tests**: backend `tests/test_dimensions.py` (**+25**, 145→170): pctile
+  invariants (min/max/median/none/singleton), None exclusion from denominator, all
+  four dimension formulas hand-computed against the stats fixture cohort, FDPR
+  inversion, all six low-confidence threshold tests, null-stats never-NaN,
+  missing-stat safe, invariant (top-R2.0 TenZ scores >70 on ≥2 dims), route 400/
+  404 + happy-path shape + cache-race fallback resolves. Frontend `player.test.ts`
+  (**+5**, 159→164): card renders with all four labels, ordinal bar format ("75th in
+  NA"), low-confidence asterisk + tooltip, out-of-cohort empty-state message,
+  normalizePlayerDimensions mapping.
+
+## Phase 12 — stats leaderboard (HLTV-style player rankings)
+
+VLR exposes its own **R2.0** rating at 100% fill on `/stats` — so this is mechanical
+scrape + display, no rating formula to design. The headline column IS R2.0; we never
+compute a composite.
+
+- [x] **Scraper (`app/scrapers/stats.py` + selectors)** — header-driven parse of the
+  one `table.wf-table` (recon-confirmed columns: Player, Agents, Rnd, R2.0, ACS, K:D,
+  KAST, ADR, KPR, APR, FKPR, FDPR, HS%, CL%, CL, KMax, K, D, A, FK, FD). New columns
+  fall through harmlessly. **Coercion guards** (the silently-wrong-numbers bug class):
+  every value reads `span.mod-both`, never raw `td.text()` (the K cell would read
+  "20119"); %-columns via `parse_percent`; the **CL fraction `3/15` splits into
+  `cl_won`/`cl_played` ints** via new `parse_fraction` (never a single number);
+  empties → null, never NaN. All selectors in `selectors.py`.
+- [x] **Service + scheduler** — `refresh_stats(region, timespan)` caches one combo;
+  `refresh_all_stats` (job id `stats`, every 6h, `max_instances=1`) warms all 8 combos,
+  skipping a failing one. Registered in `build_scheduler()` + `status_meta.JOBS` +
+  `_tracked` records `vlr:lastrun:stats`. `ttl_stats=21600` (6h, matches the cadence).
+- [x] **Endpoint** — `GET /stats?region={na|eu}&timespan={30d|60d|90d|all}&min_rnd=`
+  reads cache only (cold-miss → single-combo refresh, then re-read), validates region/
+  timespan (400 on bad), optional `min_rnd` drops tiny-sample players. Returns
+  `{data, stale, error}`. World (value-less region) 500s upstream so only na/eu allowed.
+- [x] **Frontend `/stats`** — server-seeded `StatsLeaderboard` island: R2.0 headline
+  (emphasized), NA/EU + 30d/60d/90d/all toggles that refetch `/api/stats`, click-to-sort
+  columns. **Sort is NUMERIC** (`sortLeaders` in the data layer) — never lexical, so 1024
+  sorts above 998 (the "998" < "1024" trap can't happen); default R2.0-desc, nulls sink.
+  Hydration-safe (SSR-seed, deterministic sort). `/stats` nav slot added to `SiteHeader`.
+- [x] Tests: backend `tests/test_stats.py` (**+18**, 124 → 142): `parse_fraction`/`coerce_int`,
+  scraper (mod-both not raw text, %-strip, `3/15`→(3,15)/`19/104`→(19,104), empty→null,
+  never-NaN, full key set), service cache-write (ttl + every-combo + skip-failing),
+  route (envelope shape, `min_rnd` filter, bad-region 400, cold-miss single refresh).
+  `test_status` JOBS list updated. Frontend `stats-leaderboard.test.ts` (**+12**, 136 →
+  148): `normalizeStats` null-not-NaN, **numeric-sort trap guard** (1024 > 998, incl. raw
+  strings), R2.0-desc default + nulls-last, SSR↔hydrate parity, region/timespan toggle
+  refetch, empty/error render.
+
+## Phase 11 — live match auto-refresh
+
+A live match detail used to freeze: cached scrape-on-miss at `ttl_matches=600s`,
+no job refreshing it, page server-rendered with no polling → 0:0/stale until a
+manual reload outlived the TTL. Three coordinated parts make it self-update.
+
+- [x] **Scheduler job (`refresh_live_matches`, every 30s)** — reads the live list
+  from cache (repopulates it on a miss, since `CACHE_LIVE` is written on a longer
+  cadence than its own TTL) and re-scrapes each currently-LIVE match's detail via
+  `refresh_match`, overwriting its cache. Bounded by the live list (0–4 matches),
+  `max_instances=1`. Registered in `build_scheduler()` + `status_meta.JOBS` (as
+  `live_matches`) + `_tracked` records `vlr:lastrun:live_matches` — surfaces on
+  `/status`. No-op when nothing is live.
+- [x] **Status-aware TTL (`refresh_match`)** — a LIVE match caches SHORT
+  (`ttl_live`, ~30s) so reads never serve 10-min-stale rounds; a completed match
+  keeps the long `ttl_matches`. The job refreshes; the short TTL is the backstop.
+- [x] **Page polls while live (`LiveMatchDetail` island)** — the `/match/[id]`
+  body is now a client island that SSR-seeds from `initial`, and while
+  `status === "live"` polls `/api/match/[id]` every 30s, re-rendering the scorebug
+  / scoreboard / round timeline; keeps last-good on a failed poll and STOPS once
+  the match finals (reverts to the static long-cached render). Hydration-safe:
+  state seeds from `initial`, updates only post-mount — SSR == first client render
+  (mirrors the stat-ticker island; the MapTabs tab selection survives a poll).
+- [x] Tests: backend `tests/test_live_refresh.py` (**+6**, 118 → 124): live→short
+  TTL, completed/unknown→long TTL, job refreshes only live ids (null skipped),
+  empty-list no-op, cache-miss repopulate. Frontend `live-match-detail.test.ts`
+  (**+4**, 124 → 128): SSR↔hydrate parity on a live seed, poll-updates-scorebug,
+  stop-on-final, never-polls-completed. `test_status` JOBS list updated.
+- [x] Verified on the container against the REAL live match 670473: the live list
+  had expired → the job repopulated it and refreshed **1** live match;
+  `vlr:lastrun:live_matches` recorded; `vlr:match:670473` now carries the **short
+  TTL** (≤30s, was 600s) with live data (`status:live`, Split 13-3). `tsc`/`eslint`/
+  `next build` clean.
+
+## Phase 10 — player search (`GET /api/v1/players?q=`)
+
+A search box source: type a name → that player's `/player/{id}`. Hybrid, and the
+architecture rule holds — DB is primary (clean read over our own banked data); VLR
+is touched ONLY on a DB miss and cached like the scrape-on-miss detail endpoints,
+never per-keystroke.
+
+- [x] **Primary — DB** (`app/services/search.py`): `db_search_stmt` is a pure,
+  compile-assertable statement — `DISTINCT ON (player_id)` with `ORDER BY player_id,
+  captured_at DESC` (latest snapshot per player), `WHERE alias ILIKE %q% OR real_name
+  ILIKE %q%`, capped (`RESULT_CAP=12`). Min-length guard (`≥2`) so a single letter
+  never scans. Returns `{id, alias, team, country, source:"db"}`.
+- [x] **Fallback — VLR autocomplete** (only on a DB miss): `vlr_fallback` fetches
+  `/search/auto/?term=<q>` via the app's throttled client, `parse_vlr_autocomplete`
+  pulls player entries (`value`=alias, id from `/player/(\d+)/`) and skips the
+  category headers / events / teams. Cached per casefolded term (`vlr:search:{term}`,
+  `ttl_search=600`) so a repeated miss doesn't re-hit vlr. `source:"vlr"`.
+- [x] **Self-healing flywheel**: a fallback hit returns immediately; clicking through
+  to `/player/{id}` banks a `PlayerSnapshot` via the existing route, so the player is
+  DB-searchable (`source:"db"`) next time. The fallback never eagerly fetches full
+  player pages.
+- [x] **Graceful** (`{data, stale, error}` envelope): DB error → empty + stale +
+  error (never 500); VLR fallback failure → the empty DB result, gracefully; too-short
+  / empty query → valid empty.
+- [x] Route `GET /players` (`app/api/v1/routes.py`) delegates to the service (the
+  router itself only reads; the service owns the conditional scrape). `ttl_search`
+  added to config.
+- [x] Tests (`tests/test_search.py`, **+11**, 107 → 118): compiled DB statement shape
+  (ILIKE on both name columns, DISTINCT-ON latest-per-player, cap), autocomplete parse
+  (player extraction, category/event/team skip, dedupe, cap, bad-JSON→empty),
+  min-length guard (no DB touch), DB-hit-skips-fallback, empty-DB→fallback, fallback
+  cache (2nd identical miss doesn't re-fetch), DB-error + fallback-error graceful.
+- [x] Verified on the container through the app (real DB + real VLR, never curl):
+  `?q=tenz` and `?q=ten` → DB hit (TenZ id 9, `source:db`, no cache write);
+  `?q=demon1` (not banked) → VLR fallback → Demon1 **id 26171** (+ "LEV Demon1",
+  "Lil Demon1"), `source:vlr`, and `vlr:search:demon1` cached with ttl ≈ 600s;
+  `?q=t` → empty/valid. Fallback cache confirmed live (only the miss wrote a key).
+
+## Phase 9 — player pre-scrape (scheduler job)
+
+Phase 8 made player trends queryable, but the history was THIN (snapshots only
+accrued when someone opened a player page). This job seeds that history ahead of
+time. **No new scraper, no new table, no new endpoint** — it orchestrates the
+existing match/team/player fetch paths on a schedule.
+
+- [x] `prefetch_upcoming_players` (`app/services/refresh.py`): twice-daily job.
+  Pulls `/matches`, keeps the **non-TBD** upcoming matches inside a ~48h window
+  (`eta_to_hours`, weeks counted), and for each does ONE match-detail fetch →
+  participant player IDs off the scoreboard (`participant_ids_from_match`), with a
+  fallback to the two header team IDs → team-page rosters (`roster_ids_from_team`,
+  active players only) when the lineup isn't posted yet. De-dupes to unique IDs.
+- [x] **CACHE-GATED snapshot** (the load-bearing invariant): `refresh_player`
+  writes a snapshot on EVERY call with no internal dedup, so the job replicates the
+  route's gate — `cache_get(vlr:player:{id})`; present → SKIP (fetched recently
+  on-demand or by a prior run within `ttl_players`=1h, snapshot already exists),
+  absent → `refresh_player`. Snapshots never duplicate within/across runs and the
+  job cooperates with on-demand views. Logs matches scanned / fetched / skipped.
+- [x] Scheduler registration mirrored in all three places: `build_scheduler()` adds
+  `_tracked("player_prefetch", …)` as a **cron** job (`hour="5,17"` UTC, twice
+  daily, `max_instances=1` so a long run never overlaps); `status_meta.JOBS` gains
+  `"player_prefetch"` so it surfaces on `/status`; `_tracked` records
+  `vlr:lastrun:player_prefetch` on success.
+- [x] Tests (`tests/test_prefetch.py`, **+10**, 97 → 107): pure shaping (eta parse
+  incl. the `1w 1d`=192h trap, TBD-skip, window filter, scoreboard ID extraction +
+  dedupe, staff-excluded roster fallback) and the **cache gate** — asserts
+  `refresh_player` is NOT called for a cache-present player, all-cached → zero
+  refreshes, and the no-lineup → team-roster fallback. `test_status` JOBS list
+  updated for the new job.
+- [x] Verified on the container through the app (real fetches, never curl): one
+  tracked run scanned **4** real ≤48h matches → **40** unique players → **40**
+  fetched, **0** skipped, **0** failed; `player_snapshots` grew **6 → 46** (+40,
+  == fetched); `vlr:lastrun:player_prefetch` recorded. An immediate **second run**
+  (cache now warm) → **40 skipped, 0 fetched, 46 → 46** — proving the gate prevents
+  duplicate-row corruption.
+
+## Phase 8 — player trends
+
+The player analog of Phase 4's team rating trend. READ-ONLY over banked
+`player_snapshots` — **no new scraper, no new table**. Same coercion discipline:
+the per-agent stat values (`Rating`/`ACS`/`RND`) are raw TEXT, coerced numerically
+and defensively at read time, ordered on `captured_at`, never string-compared.
+
+- [x] `GET /api/v1/trends/player/{id}` (route) — mirrors `/trends/team/{id}` shape;
+  reuses the existing `coerce_float`/`coerce_int`/`_chrono_key` helpers in
+  `app/services/trends.py`. No snapshots at all for the id → clean **404** (the
+  `/history/player` pattern, never an unhandled 500); thin/young history → a valid
+  empty series with an honest `note`, no crash.
+- [x] **Aggregation** (`aggregate_player_stats`): a snapshot is per-agent, so each
+  capture collapses into ONE **rounds-weighted overall** rating + ACS across its
+  agent rows (a 4000-round main agent dominates a 14-round off-pick). An agent row
+  contributes only when its `Rating` parses; ACS is weighted independently
+  (null-on-a-row never drops the rating); a snapshot with no parseable rating is
+  skipped, not invented. VLR shows only the current split — the drift over time is
+  the net-new signal.
+- [x] **Response shape** (`build_player_response`, pure/DB-free): `player_id`,
+  `player`, `team`, `window_days`, `rating_trend` (time-ordered points of
+  `{captured_at, rating, acs, rounds}`), `rating_change`, `acs_change`, `summary`
+  (points / current+peak rating / current+peak ACS — NUMERIC max, never a string
+  max). Identity resolves from ALL rows so a player whose history predates the
+  window still gets a name; the trend respects the window cutoff.
+- [x] Tests (`tests/test_player_trends.py`, **+18**, 79 → 97): rounds-weighted
+  aggregation · string→number coercion · unparseable-rating row skipped · None when
+  no row parses · RND fallback weight · ACS-null-keeps-rating · chronological order
+  on scrambled input · **lexical-trap on ACS** (`"998"`/`"1024"`/`"1003"` → numeric
+  peak 1024, not string max `"998"`) · `metric_change` last−first / `<2` → None ·
+  full response + summary · empty/young → valid empty + note · window cutoff.
+- [x] Verified on the container through the app (real DB + routes, never curl):
+  `player_trend("9")` (TenZ) → 2 points, rounds-weighted rating **1.15**, ACS
+  **251.8** (9298 rounds), `rating_change` 0.0 (two captures ~24h apart on
+  `timespan=all` cumulative stats → drift ≈ 0, honestly thin); route returns
+  **200** (full shape incl. `acs_change`), nonexistent id → **404**, `days=0` →
+  **422**. **Banked player history is still THIN**: `player_snapshots` holds 3 rows
+  across 2 players (id 9 ×2, id 123 ×1) — the trend is real but sparse until more
+  `/player/{id}` fetches accumulate captures.
+
+## Phase 6 — status dashboard
+
+- [x] `app/status_meta.py` — committed COMMIT / TESTS_PASSING / PHASES / HISTORY_TABLES / JOBS / DEPLOY
+- [x] Part 1 — scheduler last-run tracking: `record_job_run` + success-only `_tracked` wrapper, persistent `vlr:lastrun:<job>` key (no TTL)
+- [x] Part 2 — read-only JSON `GET /api/v1/status`: checks, history rows/newest, cache-key TTLs, scheduler last/next
+- [x] `app/core/db.py` — `check_db()` + `count_and_newest()` (per-table count(*), max(captured_at); SQL stays out of the router)
+- [x] `app/core/cache.py` — `get_last_run()`, `ping()`, `cache_ttl()` (all swallow errors, never raise)
+- [x] Part 3 — HTML `GET /status` (and `/`): broadcast style, static half server-side, JS fills live half, degrades gracefully
+- [x] Part 4 — static project metadata committed, not computed at runtime
+- [x] Tests (`tests/test_status.py`, 6): JSON shape · one bad table → null not 500 · redis down → 200 · `record_job_run` ISO + no TTL · read-only invariant (no refresh ever called) · HTML smoke
+
+---
+
+# frontend — broadcast dashboard (`frontend/`)
+
+Next.js broadcast dashboard living in `frontend/` (same repo, same container).
+Consumes vlr-api server-side at `http://127.0.0.1:8000/api/v1`. Conventions live in
+`frontend/CLAUDE.md`. Built in vertical slices; **stop & review at each boundary.**
+
+> This file is the build journal (completed work). For what's **planned / in-progress /
+> parked**, see the forward-looking backlog: `frontend/FEATURES.md`.
+
+- **Stack:** Next 16.2.7 · React 19.2.4 · TypeScript · Tailwind v4 · Framer Motion 12 · Vitest 2
+- **Slices done:** 6 / 7 + stat-ticker + featured-streamers + player-detail page (slice 5 scoped to team detail + trend; the carved-out player-detail page now shipped — see below)
+- **Frontend tests passing:** 159 (Vitest — transforms vs committed real fixtures + SSR→hydrate guards + ticker curation + Twitch data-layer + player-trend/page + player-card aggregates + live-map scorebug + live-match poll island + player search island + stats leaderboard numeric-sort/toggle/hydration + podium top-3/sort-update/graceful-degrade + team-tag table/podium/null-safe)
+
+## Slices
+
+- [x] **Slice 1 — scaffold + data layer + fixtures**
+- [x] **Slice 2 — broadcast primitives + design tokens**
+- [x] **Slice 3 — results + upcoming + live**
+- [x] **Slice 4 — rankings + news**
+- [x] **Slice 5 — team detail + trend** (player-detail page carved out to a follow-up)
+- [x] **Slice 6 — match-detail page** (this slice; built against the REAL Phase 7 endpoint — not a stub)
+- [x] **Stat ticker** (broadcast lower-third; presentation aggregate over existing endpoints)
+- [x] **Featured streamers** (top-of-screen watch-live bar; first external API — Twitch Helix)
+- [x] **Player detail page** (the slice-5 carve-out; leads with agent stats, Phase 8 trend secondary)
+- [ ] **Slice 7 — visual polish pass**
+
+## Slice 1 — scaffold + data layer + fixtures
+
+- [x] `create-next-app` into `frontend/` (`--src-dir`, `@/*` alias, TS, Tailwind v4); Vitest + Framer Motion added
+- [x] Root `.gitignore`: `frontend/node_modules/`, `frontend/.next/`, `frontend/.env*` (keep `.env.example`)
+- [x] `frontend/.env.example` with `VLR_API_BASE`; `next.config.ts` `allowedDevOrigins` for LAN IP
+- [x] Real response fixtures captured from the running vlr-api → `frontend/src/lib/__fixtures__/` (results, upcoming, live[empty out-of-season], rankings, news, player/9, team/2, trends/team/2; lists trimmed to 8 real items)
+- [x] `src/types/vlr.ts` — domain types + `ApiResponse<T>`
+- [x] `src/lib/vlr.ts` — `fetchUpstream` boundary, `parseNumeric` (null-not-NaN), transforms, graceful-empty loaders
+- [x] `src/lib/vlr.test.ts` — 22 Vitest tests asserting invariants (envelope, indexing, verbatim agent_stats keys, news split + fallback, numeric coercion, graceful-empty); no network
+- [x] **Banked:** `frontend/OPEN-ITEM-team-detail-500.md` — `/team/{id}` 500 is TWO bugs: (A) nonexistent id → vlr 404 → unhandled `raise_for_status`; (B) real team w/ non-ASCII roster → vlr 200, scrape OK, but `team_snapshots` INSERT 500s because the Postgres cluster is **SQL_ASCII**-encoded (confirmed). Frontend guards both.
+- **Verified deployment notes:** `?region=all` IS accepted (200, 130 teams); `/team/2` works (200)
+
+## Slice 2 — broadcast primitives + design tokens
+
+Read the `frontend-design` skill first. Aesthetic is LOCKED broadcast style; tokens
+harmonized with the palette already shipped on the API status page
+(`app/api/status_html.py`) so dashboard + status read as one product.
+
+- [x] `globals.css` — Tailwind v4 `@theme` tokens: ground/surfaces (`bg`/`panel`/`panel-2`/`line`), ink ramp (`ink`/`mut`/`dim`), meaning (`up`=green, `down`=red LIVE/loss, `warn`, `accent`=teal); atmospheric gradient ground; CSS-only `vlr-pulse` keyframes
+- [x] `layout.tsx` — fonts via `next/font/google`: Saira Condensed (display), Saira (body), JetBrains Mono (numerics); metadata
+- [x] Primitives in `src/components/`: `Panel` + `SectionHeading`, `Badge` (tones), `LiveBadge` (red pulse), `ScoreDisplay` (winner=green, loser=dim, null=dash, undecided=ink), `TableShell` (uppercase dim heads, right-aligned mono stat cells); `src/lib/cn.ts` helper
+- [x] `app/page.tsx` — primitives preview (illustrative demo values, NOT real data; replaced by the real match center in slice 3)
+- [x] Verified: `tsc` clean · `next build` clean (fonts + tokens resolve) · 22 Vitest tests still green · server smoke (HTTP 200, broadcast content + Saira present)
+
+## Slice 3 — results + upcoming + live (match center)
+
+- [x] Route handlers `src/app/api/matches/{results,upcoming,live}/route.ts` — thin, `force-dynamic`, return the data-layer `{data,stale,error}` envelope; server-side fetch only
+- [x] `MatchCard` — broadcast scorebug row (TEAM · score:score · TEAM, winner green on finals, LIVE/countdown/final marker, event+series, links out to vlr.gg source)
+- [x] `MatchSection` — titled module (Panel + heading + count) with graceful empty/stale states
+- [x] `LiveMatches` — client island seeded by SSR, polls `/api/matches/live` every 30s (upstream live TTL), keeps last good data on a failed poll
+- [x] `app/page.tsx` — match center: Live (polling) + Upcoming + Results, all fetched server-side; replaces the primitives preview
+- [x] Verified against the now-healthy vlr-api: `tsc` clean · `next build` clean · 22 Vitest green · smoke — routes return envelopes (results n=50, upcoming n=50, live n=0 empty/valid), SSR page renders real data incl. accented "LEVIATÁN" (clean post-UTF8-fix)
+
+## Slice 4 — rankings + news
+
+- [x] Route handlers `src/app/api/{rankings,news}/route.ts` — thin, `force-dynamic`, return the data-layer `{data,stale,error}` envelope; server-side fetch only. `rankings` passes `?region=` through (defaults `all`)
+- [x] `RankingsPanel` — lean broadcast table of EXACTLY the four fields vlr-api serves: rank / team / region / rating (`TableShell`, rank+rating right-aligned mono). rank+rating coerced via `parseNumeric` in the data layer; nothing sorts on the raw string (Phase 4 string-sort trap)
+- [x] `NewsPanel` — headline feed as stacked lower-thirds; headline from `title` only, the split date+author sit in a separate dim footer (label-bleed guard), each row links out to vlr.gg
+- [x] Both rendered in `app/page.tsx` below the match center, server-side fetched, graceful empty/stale (empty is valid, not an error)
+- [x] Test added — news **label-bleed guard**: every headline is free of `•`/`by `/the parsed date/the parsed author (23 total, prior 22 still green)
+- [x] **Scoped deliberately lean** (see decision below): no W/L/streak/win-rate columns, no `parsePercent` helper, no API-side scraper changes
+
+### Deferred vlr-api gaps (API-side, not frontend — sequence BEFORE any column that would render them)
+
+The rankings endpoint serves only rank/team/country/rating. Two distinct upstream gaps mean a richer rankings table can't be built honestly yet; both are API-side fixes for their own tasks, out of the frontend slice boundary:
+
+1. **W/L returns `null` — selector drift.** The scraper has a slot (`RANK_RECORD = "div.rank-item-record"` → `record`) but it no longer matches current vlr.gg markup, so `record` is always `null`. Same selector-drift bug class as the Phase 7 match-detail scoreboard work. Fix + verify on container, then W/L can surface.
+2. **streak and win-rate% are not scraped at all.** No field, no selector, no schema slot anywhere in `app/scrapers/rankings.py`. Net-new scraping + schema work before either can exist.
+
+Note: the "`33%` won't parse without %-stripping" finding is real but belongs to **Phase 7 match-detail** (KAST/HS% scoreboard cells), not rankings — rankings has no percentage column. The `parsePercent` helper lands there, where it's actually consumed, not here.
+
+## Slice 5 — team detail + trend
+
+The differentiation surface: a `/team/[id]` page combining team detail (name /
+region / roster) with the rating-trend line **joined to** its results over the same
+window — the combined view the public vlrggapi never served (vlr.gg only shows
+*current* rating). Built + verified against id `2` (Sentinels): trend returns 10
+rating points + 5 results (W:3 L:2), rating line drawn, accented opponent "LEVIATÁN"
+renders clean (post-UTF8-fix).
+
+- [x] `src/app/team/[id]/page.tsx` — `force-dynamic` server component; awaits the
+  async route param, fetches `getTeam(id)` + `getTeamTrend(id)` server-side (browser
+  never touches vlr-api). Team identity header (name / tag / region badge).
+- [x] Thin route handlers `src/app/api/team/[id]/route.ts` + `api/trends/team/[id]/route.ts`
+  — `force-dynamic`, return the `{data, stale, error}` envelope; trend passes `?days=` through.
+- [x] `Sparkline` — dependency-free inline-SVG rating line (polyline + area + endpoint
+  dot); tone = direction (green up / red down / dim flat). Values arrive numeric +
+  time-ordered from the data layer; min/max math runs on numbers (no string-sort trap).
+- [x] `TeamTrendPanel` — sparkline + summary (change / current / peak / window W/L) +
+  upstream `note`. Three graceful states: errored ("trend unavailable"), young history
+  (<2 points → honest "history still young", no fake flat line), real series.
+- [x] `TeamResultsPanel` — the results join as a recent-results list, each row tagged
+  W/L with the broadcast color signal; links to the vlr.gg match; graceful-empty.
+- [x] `TeamRosterPanel` — roster as a `TableShell` (players first, staff under a divider,
+  captain badge); aliases link to vlr.gg player pages.
+- [x] **Graceful error path (mandatory):** the data layer's `load()` catch turns an
+  upstream 500 into `{data:[], stale:true, error}`; the page detects no team detail and
+  renders a page-level "Couldn't load this team" state — **HTTP 200, not a crash, not a
+  Next error boundary.** Live-verified by hitting a 500-ing id (`/team/1`).
+- [x] `RankingsPanel` team names now link to `/team/{id}` (the "click a ranked team → its
+  page" nav the error path protects); kept the locked ink color, accent only on hover.
+- [x] Coercion at the read boundary: rating/rank via `parseNumeric` (null-not-NaN). The
+  trend line is **time-ordered on the real `captured_at` timestamp** in `normalizeTrend`
+  (sort added) — never lexical, never on the rating value.
+- [x] Tests +3 (23 → 26): results-join verdicts valid · **time-ordering invariant** (a
+  scrambled series with a lexical-trap rating set must order chronologically) · empty/garbage
+  trend → valid empty, no throw. Existing 23 still green.
+- [x] Verified: `tsc` clean · `next build` clean (all 3 new routes dynamic) · 26 Vitest
+  green · live smoke — `/team/2` renders detail+trend+results; `/team/1` renders the
+  graceful error state (HTTP 200).
+- **Carved out of this pass:** the **player-detail page** (`/player/[id]`). The data layer
+  (`getPlayer`/`normalizePlayer`, `player.json` fixture) already exists from slice 1; only
+  the page/components remain. Done next; this slice stayed focused on the team trend — the
+  actual differentiation surface.
+
+### Deferred vlr-api gap #3 — team-endpoint 500 on certain ids (Bug A, the 404 handler)
+
+The `/team/{id}` (and on some ids the trend) endpoint still 500s for **ids vlr.gg has no
+page for** — e.g. `/team/1` → upstream **404** → unhandled `resp.raise_for_status()` →
+generic 500 (Bug A in `frontend/OPEN-ITEM-team-detail-500.md`). These ids are reachable
+from normal nav (a ranked team click), so the frontend guards every one (graceful "couldn't
+load this team"). **Fix (API repo):** catch `httpx.HTTPStatusError` (404) in
+`fetch_team`/`get_html` and raise `HTTPException(404)` instead of 500.
+
+**Correction to the slice prompt's premise:** the prompt expected **id `1001`/Heretics to
+500** with an open question (vlr 404 vs scraper parse failure). Verified on the container this
+pass: `/team/1001` **and** `/trends/team/1001` now both return **200** (Heretics, 11-man roster
+incl. the accented analyst name). That was **Bug B (SQL_ASCII persist)** — already **resolved**
+(DB re-encoded UTF8, see OPEN-ITEM). So the open question is answered for 1001, and the *only*
+remaining team-endpoint 500 is Bug A (the 404 handler above).
+
+**Bundle this Bug-A fix into the same vlr-api selector/endpoint repair pass** as the two
+slice-4 gaps: the W/L `rank-item-record` selector drift and the Phase 7 match-detail scoreboard
+selectors — all one HTML-drift / endpoint-hardening sweep, verified on the container.
+
+## Slice 6 — match-detail page (built against the real Phase 7 endpoint)
+
+The internal `/match/[id]` page, rebuilt fresh against vlr-api's real shape (NOT a stub,
+NOT ported from vlrggapi field names). Verified live against match `684612` (LEVIATÁN 2:1
+Global Esports, Masters London).
+
+**Premise correction (same class as Bug B / the W/L drift):** the slice prompt said "the
+match-detail API was built this session." It wasn't — only the *scoreboard scraper*
+(`app/scrapers/match_detail.py`, mod-overview selectors) existed, returning flat
+`scoreboards` with no header/maps/veto, and there was **no route, service, or cache key**.
+So this slice first **built the backend `/match/{id}` endpoint**, then the frontend.
+
+**Backend (API, this slice):**
+- `app/scrapers/match_detail.py` rebuilt to the rich shape: header (event, series, status,
+  format, teams + ids + series score + `won`), veto strip, per-map list (name, picked/decider,
+  `[team1,team2]` map score), per-map per-team player rows, the aggregate "All Maps", and the
+  **round timeline** (per round: winner 1|2, side t/ct, outcome elim/boom/defuse/time,
+  cumulative score). Scoreboard cells still read `span.mod-both` (never the concatenation),
+  KAST/HS% via `parse_percent`, empty live cells → null.
+- `refresh_match` + `CACHE_MATCH` (on-demand, no history snapshot) + `GET /match/{id}` route
+  (VlrNotFound → clean 404). Tests: `tests/test_match_detail.py` rewritten to the rich shape
+  (header/maps/rounds + the concatenation/percent/empty-cell invariants), 9 → 12.
+- Backend suite: 72 → **75**. `systemctl restart vlr-api` applied so the live endpoint serves it.
+
+**Frontend (this slice):**
+- Types `MatchDetail/MatchMap/MatchRound/MatchStatCell/...`; `normalizeMatch` + `getMatch`
+  loader (single object → one-element list; stat `value` re-coerced via `parseNumeric`,
+  null-not-NaN; KAST/HS% arrive as bare numbers with `both` keeping "59%" for display).
+- `src/app/match/[id]/page.tsx` — force-dynamic server component; thin `api/match/[id]` handler;
+  graceful "couldn't load this match" on 404/error (HTTP 200, no crash).
+- Components: `MatchHeader` (scorebug + veto + "Open on VLR.gg"), `MapTabs` (client island,
+  one tab per map + All Maps, picked/decider marked; allowedDevOrigins already has 192.168.1.35),
+  `PlayerStatsTable` (R/ACS/K/D/A/+−/KAST/ADR/HS%/FK/FD; empty → dash), `RoundTimeline`
+  (green/red square strip per team, omits gracefully if a map has no rounds).
+- **Round data IS exposed** (the endpoint serves it), so the timeline is real — nothing faked.
+- Match cards in the center now link to the internal `/match/{id}` (was: out to vlr.gg); the
+  source link moved onto the detail page. Fixture `match.json` (real 684612 response) committed.
+- Verified: `tsc` clean · `next build` clean (`/match/[id]` + `/api/match/[id]` dynamic) · Vitest
+  26 → **32** · live smoke `/match/684612` renders header + map tabs + both scoreboards + round
+  strip; `/match/000000` → graceful error; home cards land internally (100 `/match/` links, 0
+  vlr.gg match links).
+
+## Player card header (`/player/[id]` restructure)
+
+Restructured the player page to lead with an ESPN-style **player card** above the
+agent table. Grounding (real markup, Boo id 1144): VLR exposes **no totals row —
+only per-agent rows**, so the card's headline aggregates are computed in the data
+layer, ROUNDS-WEIGHTED (same approach as the Phase 8 trend service).
+
+- [x] `playerOverall` / `signatureAgent` (`lib/vlr.ts`, pure + tested): three
+  headline numbers — overall **Rating** + **ACS** rounds-weighted across agents
+  (weight by RND, fall back to 1, skip rows that don't parse), and **K/D** as
+  summed ΣK/ΣD (not a mean of per-agent ratios). A 5881-round Omen dominates a
+  15-round Harbor — naive avg would read 0.92, weighted reads 1.01. parseNumeric
+  throughout (dash, never NaN). Signature agent = most-played row + usage % verbatim.
+- [x] `PlayerCard` (`components/PlayerCard.tsx`): identity (alias, real name,
+  team→`/team/{id}`, country) · weighted headline stat line · signature-agent chip
+  ("OMEN · 48%") · recent-form W/L dots (most-recent-first, win-green/loss-red) ·
+  compact rating Sparkline that shrinks to the slim young-history note when thin
+  (the degenerate-flat gate — never a fake line). Pure broadcast chroma, same card
+  vocabulary as team/match pages. Page is now card → full 14-agent table → recent
+  matches; the standalone `PlayerTrendPanel` is folded into the card (deleted).
+- [x] Tests `+10` (105 → 115): rounds-weighted overall (heavy agent dominates,
+  not naive), K/D summed aggregate, RND fallback weight, unparseable-row skip,
+  empty→null, real-fixture invariants, signature-agent pick + usage parse; page
+  test asserts the card headline (`K/D` vs the table's `K:D`), Main chip, Form
+  strip, real weighted number. Existing trend young-note + graceful-error intact.
+- [x] Verified: `tsc`/`eslint`/`next build` clean · Vitest 115 green · live smoke
+  `/player/1144` (Boo): card shows **Rating 1.01 / K/D 1.01 / ACS 186** (matches the
+  weighted compute, rejects naive 0.92), **OMEN · 48%** chip, form **L-W-W-W-W…**
+  dots, young-history trend note (no fake line); the full 14-agent table intact
+  below, order card → table → matches.
+
+## Player detail page (`/player/[id]`) — the slice-5 carve-out
+
+Mirrors the team-detail page, but inverted to match where the data is RICH. Player
+trend history is THIN at launch (snapshots only accrue when a player page is
+fetched, which didn't exist until now — TenZ has 2 points, most players 0–1), so
+the page **leads with the per-agent stat table** and treats the Phase 8 rating/ACS
+trend as a SECONDARY panel that honestly shows the young/flat state until captures
+build up.
+
+- [x] `src/app/player/[id]/page.tsx` — force-dynamic server component; fetches
+  `getPlayer` + the new `getPlayerTrend` in parallel; identity header (alias, real
+  name, team→`/team/{id}`, country); page-level graceful error ("couldn't load this
+  player", HTTP 200) when detail is absent — same philosophy as the team page.
+- [x] Thin route handlers `/api/player/[id]` + `/api/trends/player/[id]` ({data,
+  stale, error} envelope, `?days=` passthrough, graceful-empty on upstream fail).
+- [x] Data layer: `normalizePlayerTrend` + `getPlayerTrend` (parseNumeric
+  null-not-NaN; trend time-ordered on `captured_at`, never on rating/ACS value);
+  `shouldRenderTrendLine` generalized with a per-scale `epsilon` arg +
+  `PLAYER_FLAT_EPSILON` (0.03 — a player rating moves in hundredths, not hundreds).
+- [x] Components: `PlayerStatsPanel` (headline; per-agent table, agent_stats keys
+  VERBATIM, column order from the data, wide-scroll), `PlayerMatchesPanel` (recent
+  matches, W/L chroma), `PlayerTrendPanel` (reuses Sparkline + the young/flat note;
+  rating line + rating/ACS change·current·peak).
+- [x] Entry points wired: team roster aliases + match-detail scoreboard names now
+  link INTERNALLY to `/player/{id}` (id-preferred, vlr.gg fallback only when no id);
+  SiteHeader `/players` nav left a documented placeholder (no league-wide players
+  index endpoint yet — deliberately not a dead link).
+- [x] Tests `+8` (97 → **105**): `normalizePlayerTrend` (numeric coercion, captured_at
+  ordering w/ string-sort trap on ACS, empty/garbage), player-scale `shouldRenderTrendLine`,
+  and a page guard (`src/app/player.test.ts`: verbatim agent keys render, thin trend →
+  young/flat note not a fake `<svg>` line, upstream fail → graceful error).
+- [x] Verified: `tsc` clean · `eslint` clean · `next build` clean (`/player/[id]` +
+  both API routes dynamic) · Vitest 105 green · live smoke `/player/9` (TenZ) — 200,
+  identity + agent stats (verbatim `K:D`/`KAST`, value `263.8`), trend shows the
+  honest **flat** note (2 identical-rating points → no fake line, no svg), team link
+  internal; `/player/999999999` → graceful unavailable (200); team page roster → 9
+  `/player/` links, match page scoreboard → 10.
+
+## Stat ticker — broadcast lower-third (presentation aggregate, no new scraping)
+
+The bottom-of-screen scrolling marquee of **curated** notable stats. Pure presentation
+over endpoints we already serve — zero new upstream surface (decision from `FEATURES.md`:
+**curated, not random**).
+
+- **Curation (`buildTicker`, pure + tested):** aggregates already-normalized inputs into a
+  flat, render-ready `TickerItem[]`. Four notable-stat kinds, each behind an explicit gate
+  (exported consts, so "notable" is a contract, not a vibe):
+  - **TOP ACS** — headline single-map ACS per sampled match detail, gated `>= 250`.
+  - **UPSET** — a decided result whose winner is ranked `>= 3` spots **below** the loser
+    (results × rankings name-join).
+  - **MOVER** — leaderboard rank climb/drop `>= 2` positions across a team's trend window.
+  - **TREND** — a notable rating swing (`|Δ| >= 15`) when the rank held flat.
+  - One item per team (mover preferred over trend → no double-count); fixed order
+    (upsets → ACS → movers/trends); de-duped on source-derived id; capped at 12.
+- **Hydration-safe by construction:** `buildTicker` is deterministic (no clock, no
+  randomness); the scroll is **pure CSS** (`vlr-marquee` keyframes, track rendered twice,
+  `-50%` translate for a seamless loop; `prefers-reduced-motion` holds it still). `StatTicker`
+  is a server component. Values pre-formatted in the data layer — **dash, never NaN**.
+- **`getTicker` orchestration:** force-dynamic `api/ticker` route + a data-layer loader that
+  fans out (bounded: ≤4 match details, ≤6 top-team trends) over the **same** loaders the
+  match center already uses. Graceful-empty on any failure; an empty tape **hides** the
+  ticker (honest neutral state, never an error strip). Mounted at the bottom of the match
+  center (server-rendered via the same `getTicker()` call).
+- Verified: `tsc` clean · `eslint` clean · `next build` clean (`/api/ticker` dynamic) ·
+  Vitest 32 → **55** (18 new ticker tests: per-gate curation, ordering, one-per-team,
+  dash-not-NaN, empty-state, graceful-empty).
+
+## Featured streamers — watch-live bar (first external API integration)
+
+The top-of-match-center broadcast band of **Twitch channels live now** for the event.
+This is the project's **first external API integration** — and it resolved the long-open
+`FEATURES.md` data-source decision by doing **both** routes, each where it fits best:
+
+**Backend (the channel SOURCE — route (a), already shipped in Phase 7's streams scrape):**
+- `app/scrapers/match_detail.py` parses the match page's `.match-streams-container`: the
+  embeddable `.mod-embed` entries carry `data-site-id` = the bare Twitch login (e.g.
+  `valorant_br`), read directly (fallback: last path segment of the external `twitch.tv/…`
+  href). **Twitch-only** (YouTube/SOOP/etc. lack `data-site-id` → skipped), case-insensitive
+  **dedupe**, empty list valid. Surfaced as the `streams` field on `GET /match/{id}`. No new
+  fetch / scheduler / endpoint — rides the existing match-page fetch. Backend tests 75 → **79**.
+
+**Frontend (the LIVE STATUS — route (b), Twitch Helix):**
+- `src/lib/twitch.ts` — the Twitch data layer, **server-side ONLY** (the client secret never
+  reaches the browser). App access token via **client-credentials grant**, cached in memory
+  with its expiry, refreshed on expiry **or** once on a Helix 401. `getStreams(logins)` batches
+  all logins into one Helix `/streams` call (≤100), returns only the LIVE subset, `viewer_count`
+  via `parseNumeric` (null-not-NaN).
+- **Channel set = live-match channels ∪ `TWITCH_FEATURED`** (custom handles), deduped
+  case-insensitively, then **Valorant-only** filtered (no Just Chatting / other games in the
+  event bar). **Hydration-safe shuffle:** a seedable Fisher–Yates applied **once server-side at
+  request time** (`mulberry32`), never in render — one order computed on the server and sent
+  identically to SSR + client (the match center is `force-dynamic`, so each load reshuffles
+  without a hydration mismatch — the exact failure class we'd just fixed).
+- `getFeaturedStreamers` orchestration + thin `force-dynamic` `/api/streamers` route returning
+  the `{data, stale, error}` envelope. **Graceful-empty on ANY failure** (no creds, token error,
+  Helix down, nothing live) → empty bar, never an error strip. `FeaturedStreamers.tsx` server
+  component, LOCKED chroma (`LiveBadge` red, teal hover, red viewer count); each entry =
+  channel, viewer count, truncated title, link to `twitch.tv/<login>`. Empty → renders `null`
+  (hides), like the ticker. Mounted at the top of the match center.
+- `MatchDetail` gains `streams[]`; `normalizeMatch` wires it through.
+- Verified: `tsc` clean · `eslint` clean (my files) · `next build` clean (`/api/streamers`
+  dynamic) · Vitest 55 → **72** (token-flow shape, union + case-insensitive dedupe, Valorant
+  filter, viewer-count null-not-NaN, 401-refresh, graceful-empty paths, shuffle
+  deterministic-per-seed/permutation, end-to-end union→filter, + an SSR→hydrate guard). Live
+  smoke vs real Twitch: token + Helix 200; with `TWITCH_FEATURED` pointed at live Valorant
+  channels the bar renders + reshuffles per load; with the real featured set (none live this
+  moment) the bar hides — both valid.
+
+## Infra — frontend is now a managed systemd service
+
+The frontend stopped being a hand-started dev process and became a **proper managed service**
+(the reliability/uptime step the `FEATURES.md` north star calls for):
+
+- **`vlr-frontend.service`** (systemd, `User=vlr`, `WorkingDirectory=/opt/vlr-api/frontend`,
+  `ExecStart=/usr/bin/npm run start` → `next start`, `Restart=always`, ordered `After=vlr-api`).
+  Runs the **production build**, not `next dev`. ⚠️ The unit lives at
+  `/etc/systemd/system/vlr-frontend.service` — **outside the repo**, so it can't be tracked in
+  place; its full contents are pasted into `DEPLOY.md` for reproducibility on a container rebuild.
+- **`start-services.sh`** (repo root, now tracked) — one operator entrypoint for both units:
+  `start` / `stop` (web-first) / `restart` (rebuild frontend then restart both) / `build`
+  (rebuild + restart web only) / `status`.
+- **Ownership fixed** `root` → `vlr` on `frontend/` (the service user must own the build output
+  + `node_modules`), and **`frontend/.env` tightened to `640`** (Twitch secret: owner-rw,
+  group-r, world-none).
+- See `DEPLOY.md` → "9. frontend (Next.js) service" for the full setup + the unit file contents.
