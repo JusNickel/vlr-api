@@ -6,7 +6,7 @@ FIX = Path(__file__).parent / "fixtures"
 
 
 def load(name: str) -> str:
-    return (FIX / name).read_text()
+    return (FIX / name).read_text(encoding="utf-8")
 
 
 # ---------- team detail (Sentinels, id 2) ----------

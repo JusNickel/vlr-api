@@ -28,7 +28,7 @@ def load_cohort() -> list[dict]:
     separate from tests/fixtures/stats_na.html (which is a live-captured,
     real-data fixture for scraper structure tests) — the formulas below hand-
     verify exact percentile arithmetic and need fixed, round-numbered values."""
-    return parse_stats((FIX / "dimensions_cohort.html").read_text())
+    return parse_stats((FIX / "dimensions_cohort.html").read_text(encoding="utf-8"))
 
 
 # ---------- pctile helper ----------
